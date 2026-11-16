@@ -1,0 +1,470 @@
+AUDITORIA E REFORMA QUANTITATIVA — RÊMORA 1.996 E 1.995
+
+OBJETIVO GERAL
+
+Executar duas intervenções independentes e sequenciais nos códigos-fonte MQL5 das estratégias Rêmora Scalper 1.996 e 1.995, operando WIN e WDO na B3.
+
+Primeira prioridade: reformar a 1.996.
+
+Segunda prioridade: diagnosticar os bloqueios operacionais da 1.995 e substituir seu Weis Wave pelo mesmo motor de agressão.
+
+A filosofia operacional desejada é:
+
+Tendência intradiária → Enquadramento de preço → Volume agressor → Reação do preço → Confirmação de rompimento → Execução.
+
+Não transformar os robôs em estratégias genéricas de momentum, nem criar entradas apenas porque houve volume elevado.
+
+FASE 1 — REFORMA DA RÊMORA 1.996
+
+1. Preservar a filosofia de enquadramento VWAP Bands
+
+Manter as regiões objetivas da 1.996:
+
+- VWAP vigente.
+- Bandas B1, B2 e B3, superiores e inferiores.
+- Multiplicador WIN = 0,80.
+- Multiplicador WDO = 1,50.
+- Verificação da localização antes de considerar a entrada.
+- Reação do preço e rompimento posterior confirmado por negócio real.
+
+Não importar C2/C3/C4, Volume Profile ou POC da 1.995.
+
+A região não deve, isoladamente, determinar se a operação é compradora ou vendedora.
+
+2. Substituir o sigma intradiário pelo sigma histórico da 1.995
+
+Esta alteração deve reproduzir rigorosamente a metodologia matemática existente na 1.995.
+
+Auditar e reaproveitar:
+
+- "CalcSigmaHistory()"
+- "SigmaLookbackDays"
+- "Inp_SigmaFloor_WIN"
+- "Inp_SigmaFloor_WDO"
+- As rotinas auxiliares necessárias.
+
+Utilizar o sigma histórico de cinco sessões válidas como configuração inicial.
+
+Preservar a VWAP vigente como centro das bandas:
+
+"B1 = VWAP ± 1 × k × SigmaHistorico"
+
+"B2 = VWAP ± 2 × k × SigmaHistorico"
+
+"B3 = VWAP ± 3 × k × SigmaHistorico"
+
+Não substituir a VWAP por sigma: são grandezas matemáticas diferentes.
+
+Auditoria obrigatória: a VWAP incremental da 1.995 também utiliza "CopyTicksRange()". Portanto, apenas importar seu sigma não resolve automaticamente indisponibilidade de histórico de negócios.
+
+Investigar separadamente:
+
+1. Formação e atualização da VWAP vigente.
+2. Recuperação da VWAP após reinicialização.
+3. Carregamento dos candles históricos necessários ao sigma.
+4. Disponibilidade dos negócios necessários ao volume agressor.
+
+Não misturar falha de sigma com falha de VWAP.
+
+Se algum dado indispensável estiver ausente, registrar o motivo e impedir decisões fundamentadas em valores inválidos.
+
+Não criar VWAP artificial nem mudar silenciosamente para uma aproximação por candles. Qualquer alternativa aproximada deve ser apresentada separadamente, identificada e testada.
+
+3. Eliminar o Weis Wave como classificador operacional
+
+Remover as dependências estratégicas de:
+
+- "OMWavePush()"
+- "OMClassify()"
+- "OMAbsEvidence()"
+- Baseline de ondas.
+- Identificação e reversão de ondas Weis.
+- Esforço e eficiência exigidos exclusivamente pelo Weis.
+- "OMRevalidate()" na parte que exige identificação de onda.
+- Parâmetros Weis que perderem a função.
+
+Examinar todos os pontos que utilizam "waveID", "classification", "effort", "OMThesis" e "dataEpoch".
+
+Não deixar referências órfãs nem criar desbloqueios incondicionais para substituir os antigos testes Weis.
+
+Preservar as medidas de deslocamento, eficiência do preço e rejeição quando forem úteis como propriedades independentes da estrutura do mercado, sem depender da formação de ondas Weis.
+
+4. Implementar um único motor de volume agressor
+
+Aproveitar a infraestrutura existente do FAR, principalmente:
+
+- "FARBuildWindow()"
+- Leitura de "MqlTick".
+- "TICK_FLAG_BUY"
+- "TICK_FLAG_SELL"
+- "volume_real"
+- Janelas temporais de negócios reais.
+
+O novo motor deve calcular:
+
+- Volume agressor comprador.
+- Volume agressor vendedor.
+- Delta agressor.
+- Percentual de predominância agressora.
+- Evolução dessa predominância em janelas móveis.
+- Volume desconhecido ou não classificável.
+- Relação entre agressão e deslocamento efetivo do preço.
+
+O volume agressor será a única ferramenta de volume utilizada na classificação estratégica. O volume matemático empregado no cálculo da VWAP não constitui uma segunda confirmação operacional.
+
+Não confundir quantidade de contratos com valor financeiro em reais. Para calcular delta financeiro verdadeiro, validar previamente o multiplicador contratual de WIN e WDO. Caso contrário, utilizar volume agressor em contratos e informar corretamente a unidade.
+
+Negócios com classificação ambígua não podem ser atribuídos arbitrariamente a compradores ou vendedores.
+
+Se a cobertura dos dados for insuficiente, impedir a confirmação de uma nova entrada e informar exatamente o motivo, sem paralisar o cálculo independente das bandas.
+
+5. Implementar tendência intradiária persistente
+
+Criar um motor direcional com estados:
+
+- "TREND_BUY"
+- "TREND_SELL"
+- "TREND_NEUTRAL"
+- "TREND_UNAVAILABLE"
+
+A tendência não deve ser definida apenas por estar acima ou abaixo da VWAP.
+
+Considerar conjuntamente:
+
+- Progressão de máximas e mínimas.
+- Deslocamento líquido recente.
+- Persistência direcional.
+- Eficiência do percurso.
+- Evolução e inclinação da VWAP.
+- Agressão compradora/vendedora.
+- Resposta efetiva do preço à agressão.
+
+Uma correção não deve inverter a tendência automaticamente.
+
+Implementar confirmação e histerese, com parâmetros configuráveis e valores iniciais explicitamente classificados como hipóteses de pesquisa.
+
+Não escolher parâmetros com base apenas nos movimentos conhecidos de 16/11/2026.
+
+6. Reconstruir ABS e CONT sem Weis
+
+CONT: movimento direcional confirmado, pressão agressora compatível, localização elegível e reação favorável do preço.
+
+ABS: agressão relevante contra uma região, ausência de progresso proporcional do preço, rejeição objetiva e confirmação posterior de reversão.
+
+Uma absorção não está comprovada simplesmente porque ocorreu volume alto.
+
+Em tendência de alta sustentada, bloquear ABS SELL baseada apenas em uma correção local.
+
+Em tendência de baixa sustentada, bloquear ABS BUY nas mesmas condições.
+
+Uma operação contrária somente poderá ocorrer diante de deterioração ou reversão estrutural demonstrável.
+
+Na ausência de tendência, as rotas ABS e CONT deverão continuar exigindo suas evidências próprias.
+
+7. Preservar a localização sem tornar CONT impossível
+
+Auditar "OMLocationEligible()", "ObjectiveContInsideB3()" e os bloqueios "CONT_TRIGGER_OUTSIDE_B3".
+
+A versão original limita a localização CONT até B2 e exige que o disparo permaneça dentro de B3.
+
+Preservar inicialmente essa lógica como referência de comparação.
+
+Estudar uma modalidade de continuação em tendência sustentada que permita aproveitar novas oportunidades após pullbacks, sem perseguir preços excessivamente estendidos.
+
+Não remover limites de localização apenas para aumentar entradas.
+
+Registrar se uma tendência válida deixou de gerar operação por ausência de região, volume, reação ou confirmação.
+
+8. Simplificar os timeframes
+
+Substituir "Inp_ContextTF" e "Inp_SignalTF" como entradas estratégicas separadas por um único input:
+
+"Inp_AnalysisTF"
+
+Permitir M1, M2, M3, M5 e demais períodos tecnicamente suportados.
+
+O mesmo período deve governar estrutura, avaliação e sinal.
+
+As janelas internas de agressão e persistência podem ter durações próprias em segundos ou minutos, sem exigir um segundo timeframe configurável.
+
+Corrigir o ponto em "OMGetClosed()" que atualmente exige "PeriodSeconds(Inp_SignalTF)==60". Não basta trocar o nome dos inputs: é necessário adaptar snapshots, horários de fechamento, verificação de barras, FAR, sincronização e reconstrução dos dados.
+
+9. Revisar o motor de dados e telemetria
+
+Auditar:
+
+- "OMServiceStep()"
+- "OMFail()"
+- "OMReset()"
+- "OMReadChunk()"
+- "OMCommitBatch()"
+- "OMLiveReady()"
+- "OnTimer()"
+- "OnTick()"
+
+Investigar especialmente "FEED_COVERAGE_GAP", "HISTORY_CATCHUP_PENDING", "ANALYTICAL_RECOVERY_REBUILD" e as condições que estabelecem "gOMFault".
+
+O código atual pode invalidar evidências quando um intervalo de negócios excede "Inp_FeedMaxGapSec". Determinar quando essa condição é legítima e quando uma interpretação inadequada de lacunas de negociação impede a recuperação.
+
+Separar definitivamente:
+
+- BANDS_READY: geometria de mercado disponível.
+- FLOW_READY: agressão confiável.
+- SIGNAL_READY: critérios de entrada satisfeitos.
+- EXECUTION_READY: controles operacionais e financeiros liberados.
+
+Registrar o estado periodicamente e os motivos de transição, sem produzir excesso de mensagens por tick.
+
+10. Preservar execução e segurança financeira
+
+Não alterar indevidamente:
+
+- Stop-loss, take-profit ou gestão progressiva.
+- Break-even.
+- Limites diários.
+- Dimensionamento de lotes.
+- Regras de spread e overshoot.
+- Confirmação de rompimento por negócio real.
+- Reconciliação de ordens, negócios e posições.
+- Tratamento de execução incerta.
+- Proteção contra duplicidade.
+- Identidade financeira e recuperação após reinicialização.
+
+Preservar os inputs de rompimento:
+
+WIN = 175 pontos.
+
+WDO = 3,5 pontos.
+
+Não copiar automaticamente todos os defaults do PDF para a configuração operacional vigente.
+
+Implementar mudanças estratégicas em módulos separados da infraestrutura financeira.
+
+FASE 2 — AUDITORIA E REFORMA DA RÊMORA 1.995
+
+Somente depois de concluir e testar a Fase 1.
+
+11. Investigar o problema de entradas antes de modificar a estratégia
+
+Há suspeita de bloqueio relacionado a ticks ou tickets, mas a causa específica ainda não foi comprovada.
+
+Investigar as duas possibilidades separadamente.
+
+A. Ticks e histórico de negócios
+
+Auditar:
+
+- "CopyTicksRange()"
+- "CopyTradeTicksStrict()"
+- "UpdateVwapIncremental()"
+- "GetLiveVwapSnapshot()"
+- "WWReady()"
+- "WWGetClosed()"
+- Readiness e sincronização dos candles.
+- Confirmação do disparo por negócio real.
+
+Identificar se o EA reconhece o sinal, mas perde o momento de confirmação por indisponibilidade, atraso ou inconsistência dos ticks.
+
+B. Tickets e identidade financeira
+
+Auditar:
+
+- Tickets de ordens.
+- Identificadores de negócios e posições.
+- "HasOpenPosition()"
+- "HasExecutionInFlight()"
+- Reconciliação financeira.
+- "NETTING_FOREIGN".
+- Magic Number.
+- Bloqueios persistentes após uma operação de outro EA.
+
+Não presumir que toda ausência de entrada decorra de problema com tickets.
+
+12. Corrigir apenas defeitos operacionais demonstrados
+
+Para cada operação perdida, identificar em qual etapa ela parou:
+
+1. Dados disponíveis.
+2. Sinal classificado.
+3. Enquadramento aceito.
+4. Intenção armada.
+5. Gatilho atingido por negócio real.
+6. Revalidação aprovada.
+7. Ordem enviada.
+8. Execução confirmada.
+
+Registrar o primeiro motivo efetivo de rejeição.
+
+Não remover controles financeiros legítimos para forçar uma execução.
+
+13. Substituir o Weis Wave pelo motor de agressão
+
+Após isolar os defeitos de execução, implementar o mesmo módulo de volume agressor validado na 1.996.
+
+Substituir as dependências Weis em C1 e Stage2 por critérios objetivos e próprios de agressão, persistência, deslocamento e reação do preço.
+
+O FAR poderá compartilhar o coletor de negócios, mas sua função de proteção posterior deverá continuar independente da função de geração dos sinais.
+
+Não duplicar leituras extensas de "CopyTicksRange()" para calcular várias vezes os mesmos negócios.
+
+Adaptar ABS e CONT sem manter restrições de ondas Weis disfarçadas sob novos nomes.
+
+14. Revisar a tendência intradiária da 1.995
+
+A 1.995 não deve continuar utilizando apenas a posição relativa à VWAP como equivalente de tendência.
+
+Integrar o módulo de estado direcional validado na Fase 1.
+
+Preservar inicialmente os critérios originais da 1.995 em modo de comparação, para medir o efeito individual das alterações.
+
+Não importar automaticamente a lógica de regiões da 1.996: esta fase deve continuar sendo uma reforma identificável da 1.995, e não uma cópia integral da outra estratégia.
+
+FASE 3 — ISOLAMENTO E TESTES
+
+15. Impedir interferência entre versões
+
+No código fornecido, os Magic Numbers padrão são:
+
+- 1.995: WIN 60001 / WDO 60002.
+- 1.996: WIN 70001 / WDO 70002.
+
+Confirmar os valores realmente carregados em cada instância do MT5.
+
+Auditar a reutilização de nomes "Scalper1995", arquivos financeiros, locks de instância, comentários de ordens e chaves de persistência na 1.996.
+
+Não presumir isolamento completo apenas porque os Magics padrão são diferentes.
+
+Não alterar namespaces financeiros existentes sem estratégia de migração e prova de preservação dos registros anteriores.
+
+16. Comparação obrigatória
+
+Executar testes separados:
+
+- 1.996 original.
+- 1.996 reformada.
+- 1.995 original.
+- 1.995 com correções exclusivamente operacionais.
+- 1.995 com o novo motor de agressão.
+
+Comparar os mesmos dados, horários e condições de execução.
+
+Utilizar os pregões de 11, 12, 13 e 16/11/2026, quando houver histórico suficiente, e também sessões adicionais fora desse conjunto.
+
+Avaliar especialmente:
+
+- Horário em que a tendência se tornou identificável.
+- Hora da primeira oportunidade efetivamente elegível.
+- Tendências não operadas e respectivos motivos.
+- Operações contrárias ao movimento predominante.
+- Tempo entre detecção e execução.
+- Quantidade de sinais, armamentos e ordens executadas.
+- MAE, MFE, expectativa líquida, drawdown e custos.
+- Alterações de resultado provocadas por indisponibilidade de dados.
+
+Não utilizar o movimento completo conhecido retrospectivamente como se fosse lucro capturável desde seu início.
+
+17. Critérios de aceite
+
+A entrega só estará tecnicamente concluída quando:
+
+- A VWAP vigente e o sigma histórico forem calculados e auditáveis.
+- As bandas forem reproduzíveis.
+- O volume agressor estiver calculado com dados verificáveis.
+- O robô identificar e registrar a tendência intradiária de forma causal.
+- ABS contrárias não forem liberadas por simples correção local.
+- CONT não depender de evidência Weis.
+- O fluxo de armamento e execução for rastreável.
+- Os controles financeiros preservarem o comportamento esperado.
+- Ambas as versões compilarem nativamente no MetaEditor, quando este estiver disponível.
+- O replay ou teste operacional demonstrar o comportamento efetivo, sem alegar resultados inexistentes.
+
+ENTREGA DO CODEX
+
+Entregar duas versões novas e separadas, preservando os códigos originais.
+
+Fornecer:
+
+1. Diagnóstico dos problemas comprovados e das hipóteses não confirmadas.
+2. Código-fonte completo de cada versão.
+3. Diff por módulo.
+4. Inputs adicionados, removidos e preservados.
+5. Testes realizados, com resultados reproduzíveis.
+6. Evidência de compilação nativa, quando executada.
+7. Lista explícita do que ainda depende de dados reais do MT5.
+
+IMPORTANTE: o PDF da 1.996 é um arquivo consolidado gerado. Localizar os arquivos-fonte "RemoraScalper_MatrizObjetiva.mq5", "include/ObjectiveMatrix.mqh" e demais dependências do projeto. Modificar os fontes canônicos e reconstruir o consolidado pelo processo existente, em vez de editar diretamente o PDF.
+
+PROIBIDO: alegar que um problema foi corrigido apenas porque o código compilou, presumir confiabilidade dos dados de agressão sem verificá-los ou declarar melhora estatística sem testes.
+
+A meta não é produzir mais operações. É produzir decisões direcionais fundamentadas, com localização, agressão e reação do preço comprovadas, sem bloqueios técnicos silenciosos.ESPECIFICAÇÃO OBRIGATÓRIA — MOTOR DE VOLUME AGRESSOR
+
+Implementar um único motor quantitativo de agressão baseado em negócios efetivamente executados, independente do Weis Wave.
+
+1. Coleta e classificação
+
+Ler negócios por "CopyTicksRange(..., COPY_TICKS_TRADE, ...)", validando "time_msc", "last", volume e flags.
+
+- "TICK_FLAG_BUY" exclusivamente: agressão compradora.
+- "TICK_FLAG_SELL" exclusivamente: agressão vendedora.
+- Ambas as flags, nenhuma delas ou identificação inconsistente: volume de direção desconhecida.
+
+Usar "volume_real" quando disponível e confiável. Admitir "volume" inteiro apenas quando sua unidade e consistência forem verificadas. Não misturar fontes silenciosamente.
+
+Não deduplicar negócios apenas pelo timestamp: múltiplas execuções podem ocorrer no mesmo milissegundo.
+
+2. Cálculos fundamentais
+
+- "BuyVolume = soma dos volumes agressores compradores"
+- "SellVolume = soma dos volumes agressores vendedores"
+- "Delta = BuyVolume - SellVolume"
+- "BuyPct = 100 × BuyVolume / TotalVolume"
+- "SellPct = 100 × SellVolume / TotalVolume"
+- "Coverage = 100 × (BuyVolume + SellVolume) / TotalVolume"
+
+Onde "TotalVolume = BuyVolume + SellVolume + UnknownVolume".
+
+Volume desconhecido integra o denominador, mas nunca é atribuído artificialmente a um lado.
+
+Para volume financeiro em reais, validar a metodologia e o multiplicador contratual do ativo. Não apresentar contratos multiplicados simplesmente pelo preço como se fossem necessariamente valores financeiros corretos.
+
+3. Persistência direcional
+
+Avaliar a agressão em janelas móveis configuráveis, independentemente do único timeframe operacional.
+
+Identificar:
+
+- Predominância compradora persistente.
+- Predominância vendedora persistente.
+- Alternância sem dominância.
+- Agressão significativa sem deslocamento proporcional.
+
+Não considerar um único pico de delta como tendência confirmada.
+
+4. Confirmação pela resposta do preço
+
+A agressão determina quem está pressionando; o deslocamento e a estrutura mostram se essa pressão está produzindo resultado.
+
+- "CONT BUY": estrutura compradora vigente, predominância agressora compradora sustentada e retomada efetiva da alta.
+- "CONT SELL": estrutura vendedora vigente, predominância agressora vendedora sustentada e retomada efetiva da queda.
+- "ABS BUY": pressão vendedora relevante sem progresso proporcional para baixo, seguida de rejeição e reação compradora confirmada.
+- "ABS SELL": pressão compradora relevante sem progresso proporcional para cima, seguida de rejeição e reação vendedora confirmada.
+
+Nenhuma dessas condições dispensa a localização elegível ou o gatilho de rompimento.
+
+5. Validação e segurança
+
+Definir parâmetros configuráveis para cobertura mínima, dominância, persistência, intensidade relativa e resposta do preço. Não assumir valores ótimos sem testes.
+
+Se os dados de agressão estiverem indisponíveis ou não atingirem a cobertura mínima, classificar "FLOW_UNAVAILABLE" e impedir novos sinais dependentes deles.
+
+Não confundir ausência de contradição do FAR com confirmação favorável.
+
+Revalidar a evidência antes da execução, preservando as proteções financeiras e o procedimento de confirmação por negócio real.
+
+6. Telemetria
+
+Registrar por período analisado: volumes comprador, vendedor e desconhecido, delta, percentuais, cobertura, persistência, deslocamento, classificação e motivo específico de aceitação ou rejeição.
+
+Separar claramente "FLOW_UNAVAILABLE", "FLOW_NEUTRAL", "FLOW_BUY", "FLOW_SELL" e "FLOW_ABSORPTION".
+
+Não criar execução automática apenas pela existência de pressão agressora.
