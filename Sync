@@ -1,0 +1,1035 @@
+//+------------------------------------------------------------------+
+//| Remora_Sync.mq5                                                  |
+//| Infraestrutura de sincronizacao e auditoria D-1 literal          |
+//| Nao envia ordens e nao altera os EAs operacionais.               |
+//+------------------------------------------------------------------+
+#property copyright "Remora Infrastructure"
+#property version   "1.10"
+#property strict
+
+//====================================================================
+// MODO DE SELECAO DOS SIMBOLOS
+//====================================================================
+enum ENUM_REMORA_SYNC_SOURCE
+  {
+   REMORA_SYNC_EXPLICIT_LIST = 0,
+   REMORA_SYNC_MARKET_WATCH  = 1
+  };
+
+//====================================================================
+// INPUTS
+//====================================================================
+input ENUM_REMORA_SYNC_SOURCE InpSymbolSource = REMORA_SYNC_EXPLICIT_LIST;
+
+// Use exatamente os nomes que aparecem nos graficos das Remoras.
+// Atualize os vencimentos quando os contratos mudarem.
+input string InpSymbols = "WINQ26,WDOQ26";
+
+// Horario do servidor da corretora
+input int  InpTriggerHHMMSS = 84000; // 08:40:00
+
+// false = executa todos os dias uteis
+// true  = executa apenas nas segundas-feiras
+input bool InpMondayOnly = false;
+
+// Usa o mesmo relogio do servidor utilizado pelas Remoras
+input bool InpUseServerTime = true;
+
+// Somente para teste manual ao anexar o EA
+input bool InpRunImmediately = false;
+
+// Timer e tentativas
+input int InpTimerSeconds = 5;
+input int InpRetrySeconds = 10;
+
+// 80 tentativas x 10 segundos = aproximadamente 13 minutos
+input int InpMaxAttempts = 80;
+
+// Mesmo gate utilizado pelas Remoras
+input int InpMinBarsD1 = 480;
+
+// Janela ampla solicitada antes da auditoria exata do D-1
+input int InpDeepLookbackDays = 10;
+
+// Permite iniciar entre 08:40 e 08:55 após reinicio tardio do terminal
+input int InpStartWindowSeconds = 900;
+
+//====================================================================
+// ESTADOS
+//====================================================================
+enum ENUM_SYNC_JOB_STATE
+  {
+   SYNC_JOB_PENDING = 0,
+   SYNC_JOB_SUCCESS = 1,
+   SYNC_JOB_FAILED  = 2
+  };
+
+struct SyncJob
+  {
+   string              symbol;
+   ENUM_SYNC_JOB_STATE state;
+   int                 attempts;
+   datetime            next_try;
+   datetime            d1_date;
+   int                 last_bars;
+   int                 last_session_bars;
+   int                 last_error;
+  };
+
+SyncJob g_jobs[];
+
+int  g_day_key        = -1;
+bool g_cycle_started  = false;
+bool g_cycle_finished = false;
+
+//====================================================================
+// RELOGIO
+//====================================================================
+datetime ClockNow()
+  {
+   if(InpUseServerTime)
+     {
+      datetime server_time = TimeTradeServer();
+
+      if(server_time > 0)
+         return server_time;
+     }
+
+   return TimeLocal();
+  }
+
+//+------------------------------------------------------------------+
+int DayKey(const datetime when)
+  {
+   MqlDateTime dt;
+   TimeToStruct(when,dt);
+
+   return dt.year * 1000 + dt.day_of_year;
+  }
+
+//+------------------------------------------------------------------+
+int SecondsOfDay(const datetime when)
+  {
+   MqlDateTime dt;
+   TimeToStruct(when,dt);
+
+   return dt.hour * 3600 +
+          dt.min  * 60   +
+          dt.sec;
+  }
+
+//+------------------------------------------------------------------+
+bool ParseHHMMSS(const int value,
+                 int &hour,
+                 int &minute,
+                 int &second)
+  {
+   if(value < 0 || value > 235959)
+      return false;
+
+   hour   = value / 10000;
+   minute = (value / 100) % 100;
+   second = value % 100;
+
+   return
+     (
+      hour   >= 0 && hour   <= 23 &&
+      minute >= 0 && minute <= 59 &&
+      second >= 0 && second <= 59
+     );
+  }
+
+//+------------------------------------------------------------------+
+int TriggerSeconds()
+  {
+   int h = 0;
+   int m = 0;
+   int s = 0;
+
+   if(!ParseHHMMSS(InpTriggerHHMMSS,h,m,s))
+      return -1;
+
+   return h * 3600 + m * 60 + s;
+  }
+
+//+------------------------------------------------------------------+
+datetime Midnight(const datetime when)
+  {
+   MqlDateTime dt;
+   TimeToStruct(when,dt);
+
+   dt.hour = 0;
+   dt.min  = 0;
+   dt.sec  = 0;
+
+   return StructToTime(dt);
+  }
+
+//+------------------------------------------------------------------+
+bool SameDate(const datetime a,
+              const datetime b)
+  {
+   MqlDateTime da;
+   MqlDateTime db;
+
+   TimeToStruct(a,da);
+   TimeToStruct(b,db);
+
+   return
+     (
+      da.year == db.year &&
+      da.mon  == db.mon  &&
+      da.day  == db.day
+     );
+  }
+
+//+------------------------------------------------------------------+
+bool IsEligibleDay(const datetime when)
+  {
+   MqlDateTime dt;
+   TimeToStruct(when,dt);
+
+   // 0 = domingo | 6 = sabado
+   if(dt.day_of_week == 0 ||
+      dt.day_of_week == 6)
+     {
+      return false;
+     }
+
+   if(InpMondayOnly &&
+      dt.day_of_week != 1)
+     {
+      return false;
+     }
+
+   return true;
+  }
+
+//====================================================================
+// SIMBOLOS
+//====================================================================
+string TrimCopy(string value)
+  {
+   StringTrimLeft(value);
+   StringTrimRight(value);
+
+   return value;
+  }
+
+//+------------------------------------------------------------------+
+bool IsRemoraFamilySymbol(const string symbol)
+  {
+   return
+     (
+      StringFind(symbol,"WIN") >= 0 ||
+      StringFind(symbol,"IND") >= 0 ||
+      StringFind(symbol,"WDO") >= 0 ||
+      StringFind(symbol,"DOL") >= 0
+     );
+  }
+
+//+------------------------------------------------------------------+
+bool JobExists(const string symbol)
+  {
+   for(int i = 0; i < ArraySize(g_jobs); i++)
+     {
+      if(g_jobs[i].symbol == symbol)
+         return true;
+     }
+
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+bool AddJob(const string raw_symbol)
+  {
+   string symbol = TrimCopy(raw_symbol);
+
+   if(symbol == "")
+      return false;
+
+   if(JobExists(symbol))
+      return true;
+
+   int n = ArraySize(g_jobs);
+
+   if(ArrayResize(g_jobs,n + 1) != n + 1)
+      return false;
+
+   g_jobs[n].symbol            = symbol;
+   g_jobs[n].state             = SYNC_JOB_PENDING;
+   g_jobs[n].attempts          = 0;
+   g_jobs[n].next_try          = 0;
+   g_jobs[n].d1_date           = 0;
+   g_jobs[n].last_bars         = 0;
+   g_jobs[n].last_session_bars = 0;
+   g_jobs[n].last_error        = 0;
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+bool BuildJobs()
+  {
+   ArrayResize(g_jobs,0);
+
+   if(InpSymbolSource == REMORA_SYNC_EXPLICIT_LIST)
+     {
+      string parts[];
+
+      ushort separator =
+         (ushort)StringGetCharacter(",",0);
+
+      int count =
+         StringSplit(
+            InpSymbols,
+            separator,
+            parts
+         );
+
+      for(int i = 0; i < count; i++)
+         AddJob(parts[i]);
+     }
+   else
+     {
+      int total =
+         SymbolsTotal(true);
+
+      for(int i = 0; i < total; i++)
+        {
+         string symbol =
+            SymbolName(i,true);
+
+         if(IsRemoraFamilySymbol(symbol))
+            AddJob(symbol);
+        }
+     }
+
+   return ArraySize(g_jobs) > 0;
+  }
+
+//====================================================================
+// IDENTIFICACAO DO D-1 LITERAL
+//====================================================================
+bool DetermineD1Literal(const string symbol,
+                        const datetime now,
+                        datetime &d1_date,
+                        int &error_code)
+  {
+   d1_date    = 0;
+   error_code = 0;
+
+   // Primeira requisicao da serie diaria
+   datetime d1_probe[];
+
+   ResetLastError();
+
+   int probe =
+      CopyTime(
+         symbol,
+         PERIOD_D1,
+         0,
+         3,
+         d1_probe
+      );
+
+   if(probe <= 0)
+     {
+      error_code = GetLastError();
+      return false;
+     }
+
+   datetime today_start =
+      Midnight(now);
+
+   datetime bar0 =
+      iTime(
+         symbol,
+         PERIOD_D1,
+         0
+      );
+
+   if(bar0 <= 0)
+     {
+      error_code = GetLastError();
+      return false;
+     }
+
+   datetime candidate = 0;
+
+   // Se a barra D1 de hoje ja existe:
+   // o D-1 literal e a barra de shift 1.
+   if(bar0 >= today_start)
+     {
+      candidate =
+         iTime(
+            symbol,
+            PERIOD_D1,
+            1
+         );
+     }
+   else
+     {
+      // Antes da criacao da barra D1 atual:
+      // o shift 0 ainda e o ultimo pregao concluido.
+      candidate = bar0;
+     }
+
+   if(candidate <= 0)
+     {
+      error_code = GetLastError();
+      return false;
+     }
+
+   d1_date = Midnight(candidate);
+
+   return true;
+  }
+
+//====================================================================
+// REQUISICOES DE HISTORICO
+//====================================================================
+void PrimeHistoryRequests(const string symbol,
+                          const datetime d1_date,
+                          const datetime now)
+  {
+   int lookback_days =
+      MathMax(
+         1,
+         InpDeepLookbackDays
+      );
+
+   datetime deep_start =
+      d1_date -
+      (datetime)(lookback_days * 86400);
+
+   // Requisicao ampla para estimular o carregamento/formacao
+   // do historico M1 no terminal.
+   MqlRates deep_rates[];
+
+   ResetLastError();
+
+   CopyRates(
+      symbol,
+      PERIOD_M1,
+      deep_start,
+      now,
+      deep_rates
+   );
+
+   // Requisicao exata do D-1 utilizado pelas Remoras.
+   datetime day_end =
+      d1_date + 86400 - 1;
+
+   MqlRates exact_rates[];
+
+   ResetLastError();
+
+   CopyRates(
+      symbol,
+      PERIOD_M1,
+      d1_date,
+      day_end,
+      exact_rates
+   );
+
+   // Segunda solicitacao da serie temporal exata.
+   datetime exact_times[];
+
+   ResetLastError();
+
+   CopyTime(
+      symbol,
+      PERIOD_M1,
+      d1_date,
+      day_end,
+      exact_times
+   );
+
+   // Apenas telemetria.
+   // Esta propriedade nao determina sozinha o sucesso.
+   long synchronized = 0;
+
+   SeriesInfoInteger(
+      symbol,
+      PERIOD_M1,
+      SERIES_SYNCHRONIZED,
+      synchronized
+   );
+  }
+
+//====================================================================
+// AUDITORIA DO D-1
+//====================================================================
+bool AuditD1(const string symbol,
+             const datetime d1_date,
+             int &unique_bars,
+             int &session_bars,
+             datetime &first_bar,
+             datetime &last_bar,
+             int &max_gap_seconds,
+             bool &series_synchronized,
+             int &error_code)
+  {
+   unique_bars        = 0;
+   session_bars       = 0;
+   first_bar          = 0;
+   last_bar           = 0;
+   max_gap_seconds    = 0;
+   series_synchronized = false;
+   error_code         = 0;
+
+   datetime day_end =
+      d1_date + 86400 - 1;
+
+   MqlRates rates[];
+
+   ResetLastError();
+
+   int copied =
+      CopyRates(
+         symbol,
+         PERIOD_M1,
+         d1_date,
+         day_end,
+         rates
+      );
+
+   error_code =
+      GetLastError();
+
+   long sync_flag = 0;
+
+   if
+     (
+      SeriesInfoInteger(
+         symbol,
+         PERIOD_M1,
+         SERIES_SYNCHRONIZED,
+         sync_flag
+      )
+     )
+     {
+      series_synchronized =
+         sync_flag != 0;
+     }
+
+   if(copied <= 0)
+      return false;
+
+   datetime previous = 0;
+
+   for(int i = 0; i < copied; i++)
+     {
+      datetime bar_time =
+         rates[i].time;
+
+      // Ignora qualquer barra que nao pertença
+      // ao D-1 literal solicitado.
+      if(!SameDate(bar_time,d1_date))
+         continue;
+
+      // Protecao contra duplicidade.
+      if(previous > 0 &&
+         bar_time == previous)
+        {
+         continue;
+        }
+
+      if(first_bar == 0)
+         first_bar = bar_time;
+
+      if(previous > 0)
+        {
+         int gap =
+            (int)(bar_time - previous);
+
+         if(gap > max_gap_seconds)
+            max_gap_seconds = gap;
+        }
+
+      previous = bar_time;
+      last_bar = bar_time;
+
+      unique_bars++;
+
+      MqlDateTime bt;
+      TimeToStruct(bar_time,bt);
+
+      int hhmm =
+         bt.hour * 100 +
+         bt.min;
+
+      if(hhmm >= 900 &&
+         hhmm < 1825)
+        {
+         session_bars++;
+        }
+     }
+
+   // O sucesso segue o MESMO gate central das Remoras:
+   // pelo menos 480 barras M1 do D-1 literal.
+   //
+   // SERIES_SYNCHRONIZED permanece apenas como informacao no log,
+   // pois pode continuar false momentaneamente mesmo com as barras
+   // necessarias ja disponiveis.
+   return unique_bars >= InpMinBarsD1;
+  }
+
+//====================================================================
+// RETENTATIVA OU FALHA
+//====================================================================
+void FailOrRetryJob(SyncJob &job,
+                    const datetime now,
+                    const int error_code)
+  {
+   job.last_error =
+      error_code;
+
+   if(job.attempts >= InpMaxAttempts)
+     {
+      job.state =
+         SYNC_JOB_FAILED;
+
+      PrintFormat(
+         "[REMORA_SYNC][FAIL_FINAL] Symbol=%s | Attempts=%d | D1=%s | Bars=%d | SessionBars=%d | LastError=%d",
+         job.symbol,
+         job.attempts,
+         job.d1_date > 0
+            ? TimeToString(job.d1_date,TIME_DATE)
+            : "NA",
+         job.last_bars,
+         job.last_session_bars,
+         job.last_error
+      );
+
+      return;
+     }
+
+   job.next_try =
+      now +
+      MathMax(
+         1,
+         InpRetrySeconds
+      );
+  }
+
+//====================================================================
+// PROCESSAMENTO DE UM SIMBOLO
+//====================================================================
+void ProcessJob(SyncJob &job,
+                const datetime now)
+  {
+   if(job.state != SYNC_JOB_PENDING)
+      return;
+
+   if(job.next_try > 0 &&
+      now < job.next_try)
+     {
+      return;
+     }
+
+   job.attempts++;
+
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+     {
+      PrintFormat(
+         "[REMORA_SYNC][WAIT_CONNECTION] Symbol=%s | Attempt=%d/%d",
+         job.symbol,
+         job.attempts,
+         InpMaxAttempts
+      );
+
+      FailOrRetryJob(
+         job,
+         now,
+         0
+      );
+
+      return;
+     }
+
+   ResetLastError();
+
+   if(!SymbolSelect(job.symbol,true))
+     {
+      int err =
+         GetLastError();
+
+      PrintFormat(
+         "[REMORA_SYNC][SYMBOL_SELECT_FAIL] Symbol=%s | Attempt=%d/%d | Error=%d",
+         job.symbol,
+         job.attempts,
+         InpMaxAttempts,
+         err
+      );
+
+      FailOrRetryJob(
+         job,
+         now,
+         err
+      );
+
+      return;
+     }
+
+   datetime d1_date = 0;
+   int d1_error     = 0;
+
+   if
+     (
+      !DetermineD1Literal(
+         job.symbol,
+         now,
+         d1_date,
+         d1_error
+      )
+     )
+     {
+      PrintFormat(
+         "[REMORA_SYNC][D1_REF_WAIT] Symbol=%s | Attempt=%d/%d | Error=%d",
+         job.symbol,
+         job.attempts,
+         InpMaxAttempts,
+         d1_error
+      );
+
+      FailOrRetryJob(
+         job,
+         now,
+         d1_error
+      );
+
+      return;
+     }
+
+   job.d1_date =
+      d1_date;
+
+   PrimeHistoryRequests(
+      job.symbol,
+      d1_date,
+      now
+   );
+
+   int bars         = 0;
+   int session_bars = 0;
+
+   datetime first_bar = 0;
+   datetime last_bar  = 0;
+
+   int max_gap = 0;
+
+   bool synchronized = false;
+
+   int audit_error = 0;
+
+   bool ok =
+      AuditD1(
+         job.symbol,
+         d1_date,
+         bars,
+         session_bars,
+         first_bar,
+         last_bar,
+         max_gap,
+         synchronized,
+         audit_error
+      );
+
+   job.last_bars =
+      bars;
+
+   job.last_session_bars =
+      session_bars;
+
+   job.last_error =
+      audit_error;
+
+   if(ok)
+     {
+      job.state =
+         SYNC_JOB_SUCCESS;
+
+      PrintFormat(
+         "[REMORA_SYNC][OK] Symbol=%s | D1=%s | BarsUnique=%d | SessionBars=%d | MinRequired=%d | SERIES_SYNCHRONIZED=%s | First=%s | Last=%s | MaxGapSec=%d | Attempts=%d",
+         job.symbol,
+         TimeToString(d1_date,TIME_DATE),
+         bars,
+         session_bars,
+         InpMinBarsD1,
+         synchronized ? "SIM" : "NAO",
+         first_bar > 0
+            ? TimeToString(first_bar,TIME_DATE | TIME_MINUTES)
+            : "NA",
+         last_bar > 0
+            ? TimeToString(last_bar,TIME_DATE | TIME_MINUTES)
+            : "NA",
+         max_gap,
+         job.attempts
+      );
+
+      return;
+     }
+
+   PrintFormat(
+      "[REMORA_SYNC][RETRY] Symbol=%s | D1=%s | BarsUnique=%d/%d | SessionBars=%d | SERIES_SYNCHRONIZED=%s | First=%s | Last=%s | MaxGapSec=%d | Attempt=%d/%d | Error=%d",
+      job.symbol,
+      TimeToString(d1_date,TIME_DATE),
+      bars,
+      InpMinBarsD1,
+      session_bars,
+      synchronized ? "SIM" : "NAO",
+      first_bar > 0
+         ? TimeToString(first_bar,TIME_DATE | TIME_MINUTES)
+         : "NA",
+      last_bar > 0
+         ? TimeToString(last_bar,TIME_DATE | TIME_MINUTES)
+         : "NA",
+      max_gap,
+      job.attempts,
+      InpMaxAttempts,
+      audit_error
+   );
+
+   FailOrRetryJob(
+      job,
+      now,
+      audit_error
+   );
+  }
+
+//====================================================================
+// CICLO DIARIO
+//====================================================================
+void ResetDailyCycle()
+  {
+   g_cycle_started  = false;
+   g_cycle_finished = false;
+
+   ArrayResize(g_jobs,0);
+  }
+
+//+------------------------------------------------------------------+
+void StartCycle(const datetime now,
+                const string reason)
+  {
+   if(g_cycle_started)
+      return;
+
+   if(!BuildJobs())
+     {
+      g_cycle_started  = true;
+      g_cycle_finished = true;
+
+      Print(
+         "[REMORA_SYNC][FATAL] Nenhum simbolo valido foi configurado ou encontrado."
+      );
+
+      return;
+     }
+
+   g_cycle_started  = true;
+   g_cycle_finished = false;
+
+   PrintFormat(
+      "[REMORA_SYNC][START] Reason=%s | Clock=%s | Symbols=%d | MinBarsD1=%d | Retry=%ds | MaxAttempts=%d | TimeSource=%s",
+      reason,
+      TimeToString(now,TIME_DATE | TIME_SECONDS),
+      ArraySize(g_jobs),
+      InpMinBarsD1,
+      InpRetrySeconds,
+      InpMaxAttempts,
+      InpUseServerTime ? "SERVER" : "LOCAL"
+   );
+  }
+
+//+------------------------------------------------------------------+
+void FinishCycleIfReady()
+  {
+   if(!g_cycle_started ||
+      g_cycle_finished)
+     {
+      return;
+     }
+
+   int pending = 0;
+   int success = 0;
+   int failed  = 0;
+
+   for(int i = 0; i < ArraySize(g_jobs); i++)
+     {
+      if(g_jobs[i].state == SYNC_JOB_PENDING)
+         pending++;
+
+      else if(g_jobs[i].state == SYNC_JOB_SUCCESS)
+         success++;
+
+      else if(g_jobs[i].state == SYNC_JOB_FAILED)
+         failed++;
+     }
+
+   if(pending > 0)
+      return;
+
+   g_cycle_finished = true;
+
+   PrintFormat(
+      "[REMORA_SYNC][SUMMARY] Success=%d | Failed=%d | Total=%d | Result=%s",
+      success,
+      failed,
+      ArraySize(g_jobs),
+      failed == 0
+         ? "ALL_OK"
+         : "PARTIAL_OR_FAILED"
+   );
+  }
+
+//====================================================================
+// INICIALIZACAO
+//====================================================================
+int OnInit()
+  {
+   int h = 0;
+   int m = 0;
+   int s = 0;
+
+   if(!ParseHHMMSS(InpTriggerHHMMSS,h,m,s))
+     {
+      PrintFormat(
+         "[REMORA_SYNC][FATAL] InpTriggerHHMMSS invalido: %d",
+         InpTriggerHHMMSS
+      );
+
+      return INIT_PARAMETERS_INCORRECT;
+     }
+
+   if
+     (
+      InpTimerSeconds       < 1 ||
+      InpRetrySeconds       < 1 ||
+      InpMaxAttempts        < 1 ||
+      InpMinBarsD1          < 1 ||
+      InpDeepLookbackDays   < 1 ||
+      InpStartWindowSeconds < 0
+     )
+     {
+      Print(
+         "[REMORA_SYNC][FATAL] Parametros numericos invalidos."
+      );
+
+      return INIT_PARAMETERS_INCORRECT;
+     }
+
+   ResetLastError();
+
+   if(!EventSetTimer(InpTimerSeconds))
+     {
+      PrintFormat(
+         "[REMORA_SYNC][FATAL] EventSetTimer(%d) falhou | Error=%d",
+         InpTimerSeconds,
+         GetLastError()
+      );
+
+      return INIT_FAILED;
+     }
+
+   datetime now =
+      ClockNow();
+
+   g_day_key =
+      DayKey(now);
+
+   ResetDailyCycle();
+
+   PrintFormat(
+      "[REMORA_SYNC][INIT] Trigger=%02d:%02d:%02d | Timer=%ds | Mode=%s | Symbols='%s'",
+      h,
+      m,
+      s,
+      InpTimerSeconds,
+      InpSymbolSource == REMORA_SYNC_EXPLICIT_LIST
+         ? "EXPLICIT"
+         : "MARKET_WATCH",
+      InpSymbols
+   );
+
+   if(InpRunImmediately)
+     {
+      StartCycle(
+         now,
+         "RUN_IMMEDIATELY"
+      );
+     }
+
+   return INIT_SUCCEEDED;
+  }
+
+//====================================================================
+// DESINICIALIZACAO
+//====================================================================
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+  }
+
+//====================================================================
+// TIMER
+//====================================================================
+void OnTimer()
+  {
+   datetime now =
+      ClockNow();
+
+   int current_day_key =
+      DayKey(now);
+
+   if(current_day_key != g_day_key)
+     {
+      g_day_key =
+         current_day_key;
+
+      ResetDailyCycle();
+     }
+
+   if(!g_cycle_started &&
+      IsEligibleDay(now))
+     {
+      int trigger =
+         TriggerSeconds();
+
+      int current =
+         SecondsOfDay(now);
+
+      if
+        (
+         trigger >= 0 &&
+         current >= trigger &&
+         current <= trigger + InpStartWindowSeconds
+        )
+        {
+         StartCycle(
+            now,
+            "SCHEDULE"
+         );
+        }
+     }
+
+   if(!g_cycle_started ||
+      g_cycle_finished)
+     {
+      return;
+     }
+
+   for(int i = 0; i < ArraySize(g_jobs); i++)
+     {
+      ProcessJob(
+         g_jobs[i],
+         now
+      );
+     }
+
+   FinishCycleIfReady();
+  }
+
+//+------------------------------------------------------------------+
